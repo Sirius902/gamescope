@@ -2339,6 +2339,32 @@ bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press 
 		}
 	}
 
+	// Window-cycle keybindings: Super+] next, Super+[ prev, Super+Z reset
+	if ( press )
+	{
+		bool hasSuper = s_setPressedKeySyms.count( XKB_KEY_Super_L ) > 0 ||
+		                s_setPressedKeySyms.count( XKB_KEY_Super_R ) > 0;
+
+		if ( hasSuper )
+		{
+			CycleDirection dir = CycleDirection::Idle;
+
+			if ( keysym == XKB_KEY_bracketright )
+				dir = CycleDirection::Next;
+			else if ( keysym == XKB_KEY_bracketleft )
+				dir = CycleDirection::Prev;
+			else if ( keysym == XKB_KEY_Z )
+				dir = CycleDirection::Reset;
+
+			if ( dir != CycleDirection::Idle )
+			{
+				g_eCycleDirection.store( dir );
+				nudge_steamcompmgr();
+				return true;
+			}
+		}
+	}
+
 	return false;
 }
 

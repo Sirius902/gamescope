@@ -909,6 +909,32 @@ bool			hasRepaintNonBasePlane = false;
 
 bool			g_bUpdateForwardedVROverlays = false;
 
+std::atomic<CycleDirection> g_eCycleDirection{CycleDirection::Idle};
+static steamcompmgr_win_t *g_pCycleOverrideWindow = nullptr;
+
+static gamescope::ConCommand cc_window_cycle( "window_cycle", "Cycle focus to the next or previous window. Usage: window_cycle [next|prev|reset]",
+[]( std::span<std::string_view> args )
+{
+	CycleDirection dir = CycleDirection::Next;
+	if ( args.size() > 1 )
+	{
+		std::string_view arg = args[1];
+		if ( arg == "next" )
+			dir = CycleDirection::Next;
+		else if ( arg == "prev" )
+			dir = CycleDirection::Prev;
+		else if ( arg == "reset" )
+			dir = CycleDirection::Reset;
+		else
+		{
+			console_log.errorf( "window_cycle: unknown argument '%.*s'. Expected next, prev, or reset.", (int)arg.size(), arg.data() );
+			return;
+		}
+	}
+	g_eCycleDirection.store( dir );
+	nudge_steamcompmgr();
+}, false /* bRegisterScript -- first in TU, triggers scripting lazy init which throws */ );
+
 static gamescope::ConCommand cc_debug_force_repaint( "debug_force_repaint", "Force a repaint",
 []( std::span<std::string_view> args )
 {
@@ -3451,8 +3477,26 @@ pick_primary_focus_and_override(
 	bool localGameFocused = false;
 	steamcompmgr_win_t *focus = NULL, *override_focus = NULL;
 
+	// Window cycle override takes priority over all other focus selection.
+	bool bCycleOverride = false;
+	if ( g_pCycleOverrideWindow )
+	{
+		for ( steamcompmgr_win_t *w : vecPossibleFocusWindows )
+		{
+			if ( w == g_pCycleOverrideWindow )
+			{
+				focus = w;
+				localGameFocused = true;
+				bCycleOverride = true;
+				break;
+			}
+		}
+		if ( !bCycleOverride && globalFocus )
+			g_pCycleOverrideWindow = nullptr;
+	}
+
 	bool controlledFocus = eStrategy != gamescope::VirtualConnectorStrategies::SingleApplication || focusControlWindow != None || !ctxFocusControlAppIDs.empty();
-	if ( controlledFocus )
+	if ( controlledFocus && !bCycleOverride )
 	{
 		if ( eStrategy == gamescope::VirtualConnectorStrategies::SteamControlled )
 		{
@@ -5172,6 +5216,8 @@ destroy_win(xwayland_ctx_t *ctx, Window id, bool gone, bool fade)
 		ctx->focus.notificationWindow = nullptr;
 	if (x11_win(ctx->focus.overrideWindow) == id && gone)
 		ctx->focus.overrideWindow = nullptr;
+	if (g_pCycleOverrideWindow && x11_win(g_pCycleOverrideWindow) == id && gone)
+		g_pCycleOverrideWindow = nullptr;
 	if (ctx->currentKeyboardFocusWindow == id && gone)
 		ctx->currentKeyboardFocusWindow = None;
 
@@ -8519,6 +8565,63 @@ steamcompmgr_main(int argc, char **argv)
 				if ( pFocus->IsDirty() )
 				{
 					determine_and_apply_focus( pFocus );
+					hasRepaint = true;
+				}
+			}
+		}
+
+		// Window cycling: process any pending cycle request.
+		{
+			CycleDirection cycleDir = g_eCycleDirection.exchange( CycleDirection::Idle );
+			if ( cycleDir == CycleDirection::Reset )
+			{
+				g_pCycleOverrideWindow = nullptr;
+				MakeFocusDirty();
+				hasRepaint = true;
+			}
+			else if ( cycleDir != CycleDirection::Idle )
+			{
+				auto vecAllWindows = GetGlobalPossibleFocusWindows();
+
+				// Filter to the same set as GAMESCOPE_FOCUSABLE_WINDOWS:
+				// exclude useless (1x1), skip-taskbar/pager, and override-redirect windows.
+				std::vector<steamcompmgr_win_t *> vecCycleable;
+				for ( steamcompmgr_win_t *w : vecAllWindows )
+				{
+					if ( w->type == steamcompmgr_win_type_t::XWAYLAND )
+					{
+						if ( win_is_useless( w ) || win_skip_and_not_fullscreen( w ) ||
+						     w->xwayland().a.override_redirect )
+							continue;
+					}
+					vecCycleable.push_back( w );
+				}
+
+				if ( vecCycleable.size() > 1 )
+				{
+					steamcompmgr_win_t *pCurrentWindow = g_pCycleOverrideWindow;
+					if ( !pCurrentWindow )
+					{
+						global_focus_t *pCurrentFocus = GetCurrentFocus();
+						pCurrentWindow = pCurrentFocus ? pCurrentFocus->focusWindow : nullptr;
+					}
+
+					int nCurrentIdx = -1;
+					for ( int i = 0; i < (int)vecCycleable.size(); i++ )
+					{
+						if ( vecCycleable[i] == pCurrentWindow )
+						{
+							nCurrentIdx = i;
+							break;
+						}
+					}
+
+					if ( nCurrentIdx < 0 )
+						nCurrentIdx = 0;
+
+					int nNewIdx = ( nCurrentIdx + static_cast<int>( cycleDir ) + (int)vecCycleable.size() ) % (int)vecCycleable.size();
+					g_pCycleOverrideWindow = vecCycleable[nNewIdx];
+					MakeFocusDirty();
 					hasRepaint = true;
 				}
 			}

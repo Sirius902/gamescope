@@ -21,6 +21,7 @@ void steamcompmgr_main(int argc, char **argv);
 #include "wlserver.hpp"
 #include "vblankmanager.hpp"
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -135,6 +136,16 @@ extern uint64_t g_lastWinSeq;
 
 void nudge_steamcompmgr( void );
 void force_repaint( void );
+
+enum class CycleDirection : int
+{
+	Idle  =  0,
+	Next  =  1,
+	Prev  = -1,
+	Reset =  2,
+};
+
+extern std::atomic<CycleDirection> g_eCycleDirection;
 
 extern void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns );
 struct wlr_surface *steamcompmgr_get_server_input_surface( size_t idx );
