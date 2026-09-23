@@ -5118,6 +5118,33 @@ DumpFocusInfo()
 	}
 }
 
+// determine_and_apply_focus() runs the per-ctx focus pass before it reaches the cycle below, so
+// that pass has already consumed the old focusControlWindow. XSetInputFocus and _NET_ACTIVE_WINDOW
+// are issued there and nowhere else, so a cycle would otherwise only reach X once some later
+// unrelated event happened to dirty focus again. MakeFocusDirty() cannot stand in for this: the
+// global pass assigns ulCurrentFocusSerial on its way out, swallowing a bump made during the same
+// pass. Wine takes _NET_ACTIVE_WINDOW as its foreground window, so leaving it stale strands
+// keyboard and mouse input on the window we just cycled away from.
+static void reapply_ctx_focus( xwayland_ctx_t *ctx )
+{
+	// DetermineAndApplyFocus sets these, but the global pass clears them only once per pass and
+	// reads corner first, so running it twice could leave both set and park the pointer in the
+	// corner of a window that asked to be centred. Let this run's verdict replace the earlier
+	// one, keeping the earlier one when this run reaches no verdict of its own.
+	const bool bWasResetToCorner = ctx->focus.bResetToCorner;
+	const bool bWasResetToCenter = ctx->focus.bResetToCenter;
+	ctx->focus.bResetToCorner = false;
+	ctx->focus.bResetToCenter = false;
+
+	ctx->DetermineAndApplyFocus( ctx->GetPossibleFocusWindows() );
+
+	if ( !ctx->focus.bResetToCorner && !ctx->focus.bResetToCenter )
+	{
+		ctx->focus.bResetToCorner = bWasResetToCorner;
+		ctx->focus.bResetToCenter = bWasResetToCenter;
+	}
+}
+
 // Resolve a pending window_cycle request against the same candidate set that the
 // GAMESCOPE_FOCUSABLE_WINDOWS publication below is built from, and steer the existing
 // GAMESCOPECTRL_BASELAYER_WINDOW focus control at the result.
@@ -5137,6 +5164,7 @@ apply_pending_window_cycle( xwayland_ctx_t *root_ctx, const std::vector< steamco
 	{
 		root_ctx->focusControlWindow = None;
 		focus_log.infof( "window_cycle: reset, focus control released" );
+		reapply_ctx_focus( root_ctx );
 		return;
 	}
 
@@ -5201,6 +5229,8 @@ apply_pending_window_cycle( xwayland_ctx_t *root_ctx, const std::vector< steamco
 	focus_log.infof( "window_cycle: %s -> %s (0x%lx) appID=%u",
 		eRequest == WindowCycleRequest::Next ? "next" : "prev",
 		pTarget->debug_name(), pTarget->xwayland().id, pTarget->appID );
+
+	reapply_ctx_focus( root_ctx );
 }
 
 static void
