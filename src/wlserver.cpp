@@ -2556,6 +2556,27 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain )
 	}
 }
 
+// Gamescope's own hotkeys. Super_L and Super_R are distinct syms after normalization, so each
+// action registers a trigger for both. The actions run on the wlserver thread and only hand the
+// request to steamcompmgr, which owns the window list.
+namespace
+{
+	using gamescope::WaylandServer::CBuiltinActionBinding;
+
+	CBuiltinActionBinding s_BindingWindowCycleNext( "window_cycle next",
+		{ { XKB_KEY_Super_L, XKB_KEY_bracketright }, { XKB_KEY_Super_R, XKB_KEY_bracketright } },
+		[]() { steamcompmgr_cycle_window( 1 ); } );
+
+	CBuiltinActionBinding s_BindingWindowCyclePrev( "window_cycle prev",
+		{ { XKB_KEY_Super_L, XKB_KEY_bracketleft }, { XKB_KEY_Super_R, XKB_KEY_bracketleft } },
+		[]() { steamcompmgr_cycle_window( -1 ); } );
+
+	// NormalizeKeysymForHotkey upper-cases, so this must be XKB_KEY_Z rather than XKB_KEY_z.
+	CBuiltinActionBinding s_BindingWindowCycleReset( "window_cycle reset",
+		{ { XKB_KEY_Super_L, XKB_KEY_Z }, { XKB_KEY_Super_R, XKB_KEY_Z } },
+		[]() { steamcompmgr_cycle_window( 0 ); } );
+}
+
 bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press )
 {
 	xkb_keycode_t keycode = key + 8;
@@ -2596,9 +2617,9 @@ bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press 
 	{
 		using namespace gamescope::WaylandServer;
 
-		std::span<CGamescopeActionBinding *> ppBindings = CGamescopeActionBinding::GetBindings();
+		std::span<IActionBinding *> ppBindings = IActionBinding::GetBindings();
 
-		for ( CGamescopeActionBinding *pBinding : ppBindings )
+		for ( IActionBinding *pBinding : ppBindings )
 		{
 			if ( !pBinding->IsArmed() )
 				continue;

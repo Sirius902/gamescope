@@ -1137,6 +1137,47 @@ static gamescope::ConCommand cc_focus_info( "focus_info", "Dump debug info about
 	g_bPendingFocusInfo = true;
 });
 
+// Window cycling. Requests can arrive from the console thread or the wlserver thread (hotkeys),
+// but the window list belongs to the steamcompmgr thread, so we only record the request here and
+// let determine_and_apply_focus() resolve it against the live list.
+enum class WindowCycleRequest : uint32_t
+{
+	Nothing = 0,
+	Next,
+	Prev,
+	Reset,
+};
+static std::atomic<WindowCycleRequest> g_eWindowCycleRequest = { WindowCycleRequest::Nothing };
+
+void steamcompmgr_cycle_window( int nDirection )
+{
+	g_eWindowCycleRequest = nDirection > 0 ? WindowCycleRequest::Next
+		: nDirection < 0 ? WindowCycleRequest::Prev
+		: WindowCycleRequest::Reset;
+
+	MakeFocusDirty();
+	nudge_steamcompmgr();
+}
+
+static gamescope::ConCommand cc_window_cycle( "window_cycle", "Cycle focus between focusable windows (next, prev, reset)",
+[]( std::span<std::string_view> args )
+{
+	if ( args.size() < 2 )
+	{
+		console_log.errorf( "Usage: window_cycle <next|prev|reset>" );
+		return;
+	}
+
+	if ( args[1] == "next" )
+		steamcompmgr_cycle_window( 1 );
+	else if ( args[1] == "prev" )
+		steamcompmgr_cycle_window( -1 );
+	else if ( args[1] == "reset" )
+		steamcompmgr_cycle_window( 0 );
+	else
+		console_log.errorf( "Unknown window_cycle action '%.*s'. Expected next, prev or reset.", (int)args[1].size(), args[1].data() );
+});
+
 // The upscale globals belong to the steamcompmgr thread, the main loop applies these.
 static std::atomic<int32_t> g_nPendingUpscaleFilter = { -1 };
 static std::atomic<int32_t> g_nPendingUpscaleSharpness = { -1 };
@@ -5077,6 +5118,91 @@ DumpFocusInfo()
 	}
 }
 
+// Resolve a pending window_cycle request against the same candidate set that the
+// GAMESCOPE_FOCUSABLE_WINDOWS publication below is built from, and steer the existing
+// GAMESCOPECTRL_BASELAYER_WINDOW focus control at the result.
+//
+// The ring is ordered by seq rather than by the caller's priority sort: that sort re-ranks on
+// map/damage sequence as windows render, so cycling by position in it would wander. seq is unique
+// and monotonic per window, so it gives a stable creation-ordered ring, and a window that goes
+// away simply drops out of it.
+static void
+apply_pending_window_cycle( xwayland_ctx_t *root_ctx, const std::vector< steamcompmgr_win_t* > &vecPossibleFocusWindows, steamcompmgr_win_t *pCurrentFocus )
+{
+	WindowCycleRequest eRequest = g_eWindowCycleRequest.exchange( WindowCycleRequest::Nothing );
+	if ( eRequest == WindowCycleRequest::Nothing )
+		return;
+
+	if ( eRequest == WindowCycleRequest::Reset )
+	{
+		root_ctx->focusControlWindow = None;
+		focus_log.infof( "window_cycle: reset, focus control released" );
+		return;
+	}
+
+	if ( !gamescope::VirtualConnectorStrategyIsSingleOutput( gamescope::cv_backend_virtual_connector_strategy ) )
+	{
+		console_log.errorf( "window_cycle: only applies to the SingleApplication and SteamControlled strategies." );
+		return;
+	}
+
+	std::vector< steamcompmgr_win_t* > vecCycle;
+	for ( steamcompmgr_win_t *w : vecPossibleFocusWindows )
+	{
+		if ( w->type != steamcompmgr_win_type_t::XWAYLAND )
+			continue;
+
+		if ( win_is_useless( w ) || win_skip_and_not_fullscreen( w ) || w->xwayland().a.override_redirect )
+			continue;
+
+		vecCycle.push_back( w );
+	}
+
+	if ( vecCycle.size() < 2 )
+	{
+		console_log.errorf( "window_cycle: nothing to cycle to (%zu focusable window(s)).", vecCycle.size() );
+		return;
+	}
+
+	std::stable_sort( vecCycle.begin(), vecCycle.end(),
+		[]( steamcompmgr_win_t *a, steamcompmgr_win_t *b ) { return a->seq < b->seq; } );
+
+	// Anchor on the explicit control window when we have one, otherwise on whatever is focused
+	// right now, so the first step moves off the window the user is actually looking at.
+	Window anchor = root_ctx->focusControlWindow;
+	if ( anchor == None && pCurrentFocus && pCurrentFocus->type == steamcompmgr_win_type_t::XWAYLAND )
+		anchor = pCurrentFocus->xwayland().id;
+
+	size_t nIndex = 0;
+	bool bFound = false;
+	for ( size_t i = 0; i < vecCycle.size(); i++ )
+	{
+		if ( vecCycle[ i ]->xwayland().id == anchor )
+		{
+			nIndex = i;
+			bFound = true;
+			break;
+		}
+	}
+
+	// A stale or unknown anchor (the window closed, or Steam pointed us at something gone)
+	// just starts the walk from the end of the ring we are heading into.
+	size_t nNext;
+	if ( !bFound )
+		nNext = eRequest == WindowCycleRequest::Next ? 0 : vecCycle.size() - 1;
+	else if ( eRequest == WindowCycleRequest::Next )
+		nNext = ( nIndex + 1 ) % vecCycle.size();
+	else
+		nNext = ( nIndex + vecCycle.size() - 1 ) % vecCycle.size();
+
+	steamcompmgr_win_t *pTarget = vecCycle[ nNext ];
+	root_ctx->focusControlWindow = pTarget->xwayland().id;
+
+	focus_log.infof( "window_cycle: %s -> %s (0x%lx) appID=%u",
+		eRequest == WindowCycleRequest::Next ? "next" : "prev",
+		pTarget->debug_name(), pTarget->xwayland().id, pTarget->appID );
+}
+
 static void
 determine_and_apply_focus( global_focus_t *pFocus )
 {
@@ -5156,6 +5282,8 @@ determine_and_apply_focus( global_focus_t *pFocus )
 
 	XChangeProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeFocusableWindowsAtom, XA_CARDINAL, 32, PropModeReplace,
 					 (unsigned char *)focusable_windows.data(), focusable_windows.size() );
+
+	apply_pending_window_cycle( root_ctx, vecPossibleFocusWindows, previousLocalFocus.focusWindow );
 
 	gameFocused = pick_primary_focus_and_override( pFocus, root_ctx->focusControlWindow, vecPossibleFocusWindows, true, vecFocuscontrolAppIDs,
 		pFocus->ulVirtualFocusKey,

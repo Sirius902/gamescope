@@ -143,6 +143,10 @@ void nudge_steamcompmgr( void );
 void MakeFocusDirty();
 void force_repaint( void );
 
+// Step the focused window along the focusable list. nDirection > 0 is next, < 0 is prev,
+// 0 releases the cycle's focus control. Safe to call from any thread.
+void steamcompmgr_cycle_window( int nDirection );
+
 // Per-connector stat snapshot for typed mangoapp streams.
 struct MangoappSnapshot_t
 {

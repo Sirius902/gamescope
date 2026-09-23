@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <array>
+#include <functional>
 #include <unordered_set>
 
 #include "Utils/Algorithm.h"
@@ -89,9 +90,40 @@ namespace gamescope::WaylandServer
     };
 
     ///////////////////////////
+    // IActionBinding
+    ///////////////////////////
+    // Everything the hotkey dispatcher can fire, whether it came from an external Wayland client
+    // over gamescope_action_binding or gamescope declared it itself.
+    class IActionBinding
+    {
+    public:
+        virtual ~IActionBinding() {}
+
+        virtual bool IsArmed() = 0;
+        virtual std::span<Keybind_t> GetKeyboardTriggers() = 0;
+        // Returns true if the key should be swallowed instead of reaching the focused app.
+        virtual bool Execute() = 0;
+
+        static std::span<IActionBinding *> GetBindings() { return Registry(); }
+
+    protected:
+        void RegisterBinding() { Registry().push_back( this ); }
+        void UnregisterBinding() { std::erase_if( Registry(), [this]( IActionBinding *pBinding ){ return pBinding == this; } ); }
+
+    private:
+        // Function-local so built-in bindings constructed during static init cannot race the
+        // registry's own construction.
+        static std::vector<IActionBinding *> &Registry()
+        {
+            static std::vector<IActionBinding *> s_Bindings;
+            return s_Bindings;
+        }
+    };
+
+    ///////////////////////////
     // CGamescopeActionBinding
     ///////////////////////////
-    class CGamescopeActionBinding : public CWaylandResource
+    class CGamescopeActionBinding : public CWaylandResource, public IActionBinding
     {
     public:
 		WL_PROTO_DEFINE( gamescope_action_binding, 1 );
@@ -99,12 +131,12 @@ namespace gamescope::WaylandServer
 		CGamescopeActionBinding( WaylandResourceDesc_t desc )
             : CWaylandResource( desc )
         {
-            s_Bindings.push_back( this );
+            RegisterBinding();
         }
 
         ~CGamescopeActionBinding()
         {
-            std::erase_if( s_Bindings, [this]( CGamescopeActionBinding *pBinding ){ return pBinding == this; } );
+            UnregisterBinding();
         }
 
         // gamescope_action_binding
@@ -153,10 +185,10 @@ namespace gamescope::WaylandServer
 
         //
 
-        bool IsArmed() { return m_ouArmFlags != std::nullopt; }
-        std::span<Keybind_t> GetKeyboardTriggers() { return m_KeyboardTriggers; }
+        bool IsArmed() override { return m_ouArmFlags != std::nullopt; }
+        std::span<Keybind_t> GetKeyboardTriggers() override { return m_KeyboardTriggers; }
 
-        bool Execute()
+        bool Execute() override
         {
             if ( !IsArmed() )
                 return false;
@@ -184,17 +216,11 @@ namespace gamescope::WaylandServer
             return bBlockInput;
         }
 
-        static std::span<CGamescopeActionBinding *> GetBindings()
-        {
-            return s_Bindings;
-        }
     private:
         std::string m_sDescription;
         std::vector<Keybind_t> m_KeyboardTriggers;
 
         std::optional<uint32_t> m_ouArmFlags;
-
-        static std::vector<CGamescopeActionBinding *> s_Bindings;
     };
 
 	const struct gamescope_action_binding_interface CGamescopeActionBinding::Implementation =
@@ -207,7 +233,52 @@ namespace gamescope::WaylandServer
         .disarm = WL_PROTO( CGamescopeActionBinding, Disarm ),
 	};
 
-    std::vector<CGamescopeActionBinding *> CGamescopeActionBinding::s_Bindings;
+    ///////////////////////////
+    // CBuiltinActionBinding
+    ///////////////////////////
+    // A hotkey gamescope declares for itself. CGamescopeActionBinding is a CWaylandResource and so
+    // can only ever be created by a client over gamescope_action_binding; this is the in-process
+    // equivalent. Built-ins are always armed and always swallow the key.
+    class CBuiltinActionBinding final : public IActionBinding
+    {
+    public:
+        CBuiltinActionBinding( std::string_view svDescription, std::vector<std::vector<xkb_keysym_t>> vecTriggers, std::function<void()> fnAction )
+            : m_sDescription{ svDescription }
+            , m_fnAction{ std::move( fnAction ) }
+        {
+            for ( const std::vector<xkb_keysym_t> &trigger : vecTriggers )
+            {
+                std::unordered_set<xkb_keysym_t> setKeySyms;
+                for ( xkb_keysym_t uKeySym : trigger )
+                    setKeySyms.emplace( NormalizeKeysymForHotkey( uKeySym ) );
+
+                std::string sTriggerDebugName = ComputeDebugName( setKeySyms );
+                m_KeyboardTriggers.emplace_back( std::move( setKeySyms ), std::move( sTriggerDebugName ) );
+            }
+
+            RegisterBinding();
+        }
+
+        ~CBuiltinActionBinding()
+        {
+            UnregisterBinding();
+        }
+
+        bool IsArmed() override { return true; }
+        std::span<Keybind_t> GetKeyboardTriggers() override { return m_KeyboardTriggers; }
+
+        bool Execute() override
+        {
+            log_binding.debugf( "(%s) -> Triggered!", m_sDescription.c_str() );
+            m_fnAction();
+            return true;
+        }
+
+    private:
+        std::string m_sDescription;
+        std::vector<Keybind_t> m_KeyboardTriggers;
+        std::function<void()> m_fnAction;
+    };
 
     //////////////////////////////////
     // CGamescopeActionBindingManager
