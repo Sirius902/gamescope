@@ -131,6 +131,9 @@ gamescope::ConVar<bool> cv_overlay_unmultiplied_alpha{ "overlay_unmultiplied_alp
 
 gamescope::ConVar<bool> cv_vr_show_forwarded_overlays{ "vr_show_forwarded_overlays", false };
 
+gamescope::ConVar<bool> cv_send_wm_take_focus{ "send_wm_take_focus", true,
+	"Send WM_TAKE_FOCUS to focused clients that ask for it. Required by ICCCM for Globally Active clients, which never take focus themselves; without it such a window stays deactivated even while it holds X focus. Off restores the old behaviour for comparison." };
+
 std::string *g_pVROverlayKey = nullptr;
 bool g_bWasPartialComposite = false;
 
@@ -4565,6 +4568,49 @@ found:;
 	return vecPossibleFocusWindows;
  }
 
+// ICCCM 4.1.7: a client whose WM_HINTS says input=False and which lists
+// WM_TAKE_FOCUS in WM_PROTOCOLS uses the "Globally Active" input model. Such a
+// client never takes focus on its own, so XSetInputFocus alone leaves it
+// deactivated no matter what the X focus says. Wine turns WM_TAKE_FOCUS into
+// SetForegroundWindow, so without it a game we focus stays deactivated: it
+// never resumes presenting and never grabs the pointer.
+static void send_take_focus( xwayland_ctx_t *ctx, Window win )
+{
+	if ( !cv_send_wm_take_focus )
+		return;
+
+	Atom *pProtocols = nullptr;
+	int nProtocols = 0;
+	if ( !XGetWMProtocols( ctx->dpy, win, &pProtocols, &nProtocols ) )
+		return;
+
+	bool bWantsTakeFocus = false;
+	for ( int i = 0; i < nProtocols; i++ )
+	{
+		if ( pProtocols[ i ] == ctx->atoms.wm_take_focus )
+		{
+			bWantsTakeFocus = true;
+			break;
+		}
+	}
+	XFree( pProtocols );
+
+	if ( !bWantsTakeFocus )
+		return;
+
+	xwm_log.debugf( "Sending WM_TAKE_FOCUS to window 0x%lx", win );
+
+	XEvent event = {};
+	event.xclient.type = ClientMessage;
+	event.xclient.window = win;
+	event.xclient.message_type = ctx->atoms.wm_protocols;
+	event.xclient.format = 32;
+	event.xclient.data.l[0] = ctx->atoms.wm_take_focus;
+	event.xclient.data.l[1] = CurrentTime;
+
+	XSendEvent( ctx->dpy, win, False, NoEventMask, &event );
+}
+
 static void set_wm_state( xwayland_ctx_t *ctx, Window win, uint32_t state )
 {
 	uint32_t wmState[] = { state, None };
@@ -4763,6 +4809,9 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 			Window activeWindow = keyboardFocusWin->xwayland().id;
 			XChangeProperty(ctx->dpy, ctx->root, ctx->atoms.netActiveWindowAtom,
 							XA_WINDOW, 32, PropModeReplace, (unsigned char *)&activeWindow, 1);
+
+			// Globally Active clients need this to actually activate. See above.
+			send_take_focus( ctx, keyboardFocusWindow );
 		}
 
 		if ( ctx->focus.inputFocusWindow != inputFocus ||
@@ -9035,6 +9084,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 
 	ctx->atoms.wm_protocols = XInternAtom(ctx->dpy, "WM_PROTOCOLS", false);
 	ctx->atoms.wm_delete_window = XInternAtom(ctx->dpy, "WM_DELETE_WINDOW", false);
+	ctx->atoms.wm_take_focus = XInternAtom(ctx->dpy, "WM_TAKE_FOCUS", false);
 
 	ctx->root_width = DisplayWidth(ctx->dpy, ctx->scr);
 	ctx->root_height = DisplayHeight(ctx->dpy, ctx->scr);
