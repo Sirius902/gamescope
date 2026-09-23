@@ -5160,17 +5160,19 @@ apply_pending_window_cycle( xwayland_ctx_t *root_ctx, const std::vector< steamco
 	if ( eRequest == WindowCycleRequest::Nothing )
 		return;
 
+	// Reset is guarded too: releasing focus control elsewhere would discard whatever Steam put in
+	// GAMESCOPECTRL_BASELAYER_WINDOW, which is the only other writer of focusControlWindow.
+	if ( !gamescope::VirtualConnectorStrategyIsSingleOutput( gamescope::cv_backend_virtual_connector_strategy ) )
+	{
+		console_log.errorf( "window_cycle: only applies to the SingleApplication and SteamControlled strategies." );
+		return;
+	}
+
 	if ( eRequest == WindowCycleRequest::Reset )
 	{
 		root_ctx->focusControlWindow = None;
 		focus_log.infof( "window_cycle: reset, focus control released" );
 		reapply_ctx_focus( root_ctx );
-		return;
-	}
-
-	if ( !gamescope::VirtualConnectorStrategyIsSingleOutput( gamescope::cv_backend_virtual_connector_strategy ) )
-	{
-		console_log.errorf( "window_cycle: only applies to the SingleApplication and SteamControlled strategies." );
 		return;
 	}
 
@@ -5230,7 +5232,16 @@ apply_pending_window_cycle( xwayland_ctx_t *root_ctx, const std::vector< steamco
 		eRequest == WindowCycleRequest::Next ? "next" : "prev",
 		pTarget->debug_name(), pTarget->xwayland().id, pTarget->appID );
 
-	reapply_ctx_focus( root_ctx );
+	// The global pick resolves root's focusControlWindow against every server's window list, so
+	// the cycle reaches its target wherever it lives. Re-applying a per-ctx pass is only
+	// meaningful for root, though: each ctx matches focusControlWindow against its own list, and
+	// XIDs are per-server and collide, so handing root another server's XID would have it focus
+	// an unrelated window of its own or fall through to its top-priority one. Steering the
+	// target's own server would mean writing focusControlWindow on that ctx, which is where its
+	// GAMESCOPECTRL_BASELAYER_WINDOW lives, so leave that alone: with more than one xwayland
+	// server a cross-server cycle keeps the pre-existing behaviour of reaching X on a later pass.
+	if ( pTarget->xwayland().ctx == root_ctx )
+		reapply_ctx_focus( root_ctx );
 }
 
 static void
