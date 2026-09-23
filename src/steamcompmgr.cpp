@@ -4321,24 +4321,29 @@ pick_primary_focus_and_override(
 	bool controlledFocus = eStrategy != gamescope::VirtualConnectorStrategies::SingleApplication || focusControlWindow != None || !ctxFocusControlAppIDs.empty();
 	if ( controlledFocus )
 	{
-		if ( eStrategy == gamescope::VirtualConnectorStrategies::SteamControlled )
+		// GAMESCOPECTRL_BASELAYER_WINDOW names one specific window, which is meaningful in any
+		// single-output strategy rather than just SteamControlled -- in SingleApplication the
+		// property used to flip controlledFocus on and then never be consulted again.
+		// The multi-output strategies pick per connector below and must not all collapse onto
+		// the single controlled window, so they keep their existing behavior.
+		if ( focusControlWindow != None && gamescope::VirtualConnectorStrategyIsSingleOutput( eStrategy ) )
 		{
-			if ( focusControlWindow != None )
+			for ( steamcompmgr_win_t *focusable_window : vecPossibleFocusWindows )
 			{
-				for ( steamcompmgr_win_t *focusable_window : vecPossibleFocusWindows )
-				{
-					if ( focusable_window->type != steamcompmgr_win_type_t::XWAYLAND )
-						continue;
+				if ( focusable_window->type != steamcompmgr_win_type_t::XWAYLAND )
+					continue;
 
-					if ( focusable_window->xwayland().id == focusControlWindow )
-					{
-						focus = focusable_window;
-						localGameFocused = true;
-						goto found;
-					}
+				if ( focusable_window->xwayland().id == focusControlWindow )
+				{
+					focus = focusable_window;
+					localGameFocused = true;
+					goto found;
 				}
 			}
+		}
 
+		if ( eStrategy == gamescope::VirtualConnectorStrategies::SteamControlled )
+		{
 			for ( auto focusable_appid : ctxFocusControlAppIDs )
 			{
 				for ( steamcompmgr_win_t *focusable_window : vecPossibleFocusWindows )
