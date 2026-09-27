@@ -10725,6 +10725,19 @@ steamcompmgr_main(int argc, char **argv)
 				if ( cv_mouse_relative_requires_hidden_cursor )
 					bRelativeMouseMode = bRelativeMouseMode && pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty();
 
+				// Keep the host told where our client believes the cursor is, so
+				// that when the lock is dropped it has somewhere correct to put
+				// its pointer. cursor->x()/y() is already the constraint's hint
+				// when there is one, which is precisely the position the client
+				// asked for. Undo this layer's half of the input transform and
+				// hand the backend plain output coordinates.
+				if ( bRelativeMouseMode && pPaintFocus->cursor && focusedWindowScaleX != 0.0f && focusedWindowScaleY != 0.0f )
+				{
+					pPaintFocus->GetNestedHints()->SetCursorPositionHint(
+						pPaintFocus->cursor->x() / focusedWindowScaleX - focusedWindowOffsetX,
+						pPaintFocus->cursor->y() / focusedWindowScaleY - focusedWindowOffsetY );
+				}
+
 				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
 			}
 

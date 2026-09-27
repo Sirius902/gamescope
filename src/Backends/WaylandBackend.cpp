@@ -462,6 +462,7 @@ namespace gamescope
 
         virtual void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info ) override;
         virtual void SetRelativeMouseMode( bool bRelative ) override;
+        virtual void SetCursorPositionHint( double flOutputX, double flOutputY ) override;
         virtual void SetVisible( bool bVisible ) override;
         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
         virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) override;
@@ -696,6 +697,8 @@ namespace gamescope
 
         void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info );
         void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
+        void SetCursorPositionHint( double flOutputX, double flOutputY );
+        void SendCursorPositionHintToHost();
         void UpdateCursor();
 
         friend CWaylandConnector;
@@ -841,6 +844,12 @@ namespace gamescope
 		bool m_bPointerLocked = false;
         wl_surface *m_pLockedSurface = nullptr;
         zwp_relative_pointer_v1 *m_pRelativePointer = nullptr;
+        // Where our client thinks the cursor is, in gamescope output
+        // coordinates, so we can hand it to the host when we release the lock.
+        std::optional<std::pair<double, double>> m_oCursorPositionHint;
+        // The lock object that value was last sent to, so a new one gets told
+        // even when the position has not moved.
+        zwp_locked_pointer_v1 *m_pCursorHintSentTo = nullptr;
 
         bool m_bCanUseModifiers = false;
         std::unordered_map<uint32_t, std::vector<uint64_t>> m_FormatModifiers;
@@ -1246,6 +1255,10 @@ namespace gamescope
     {
         // TODO: Do more tracking across multiple connectors, and activity here if we ever want to use this.
         m_pBackend->SetRelativeMouseMode( m_Planes[0].GetSurface(), bRelative );
+    }
+    void CWaylandConnector::SetCursorPositionHint( double flOutputX, double flOutputY )
+    {
+        m_pBackend->SetCursorPositionHint( flOutputX, flOutputY );
     }
     void CWaylandConnector::SetVisible( bool bVisible )
     {
@@ -2438,8 +2451,19 @@ namespace gamescope
             {
                 assert( m_pRelativePointer );
 
+                // The cursor position hint has been kept current on this lock
+                // for its whole lifetime, so the host already knows where to
+                // leave its pointer. That is the one repositioning the protocol
+                // sanctions, and it explicitly produces no relative motion;
+                // without it the host restores the pointer to wherever it was
+                // when we grabbed it, which is why the cursor used to reappear
+                // at the spot the client last dismissed a menu rather than
+                // where the client has since put it.
                 zwp_locked_pointer_v1_destroy( m_pLockedPointer );
                 m_pLockedPointer = nullptr;
+                // Not just tidiness: a later lock can land on the same address,
+                // and would then look like one we had already told.
+                m_pCursorHintSentTo = nullptr;
                 m_bPointerLocked = false;
 
                 zwp_relative_pointer_v1_destroy( m_pRelativePointer );
@@ -2462,6 +2486,63 @@ namespace gamescope
 
             UpdateCursor();
         }
+    }
+
+    void CWaylandBackend::SetCursorPositionHint( double flOutputX, double flOutputY )
+    {
+        const auto oHint = std::make_pair( flOutputX, flOutputY );
+
+        // This runs every frame, and the cursor is usually parked. Only say
+        // something when there is something new to say -- or when the lock
+        // itself is new, since the hint is state on that object and a fresh one
+        // has never been told anything.
+        if ( m_oCursorPositionHint == oHint && m_pCursorHintSentTo == m_pLockedPointer )
+            return;
+
+        m_oCursorPositionHint = oHint;
+
+        // Push it out now rather than at release time. The hint is
+        // double-buffered against the locked surface, and the present path
+        // already commits that surface every frame, so it is never more than a
+        // frame stale and we never have to commit out of band. Committing here
+        // ourselves would risk applying half-built frame state, or applying
+        // surface state without the libdecor state CWaylandPlane::Commit()
+        // pairs with it.
+        SendCursorPositionHintToHost();
+    }
+
+    // Undo only this layer's half of the transform that Wayland_Pointer_Motion
+    // applies on the way in:
+    //
+    //   flOutput = surface_local * uFractionalScale / 120 + nDest
+    //
+    // wlserver undoes its own half (the focused window offset and scale) before
+    // handing us output coordinates, so neither side has to know about the
+    // other's.
+    void CWaylandBackend::SendCursorPositionHintToHost()
+    {
+        if ( !m_pLockedPointer || !m_pLockedSurface || !m_oCursorPositionHint )
+            return;
+
+        CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( m_pLockedSurface );
+        if ( !pPlane )
+            return;
+
+        auto oState = pPlane->GetCurrentState();
+        if ( !oState )
+            return;
+
+        const uint32_t uScale = oState->uFractionalScale;
+        if ( !uScale )
+            return;
+
+        const double flSurfaceX = ( m_oCursorPositionHint->first  - oState->nDestX ) * 120.0 / uScale;
+        const double flSurfaceY = ( m_oCursorPositionHint->second - oState->nDestY ) * 120.0 / uScale;
+
+        zwp_locked_pointer_v1_set_cursor_position_hint( m_pLockedPointer,
+            wl_fixed_from_double( flSurfaceX ), wl_fixed_from_double( flSurfaceY ) );
+
+        m_pCursorHintSentTo = m_pLockedPointer;
     }
 
     void CWaylandBackend::UpdateCursor()

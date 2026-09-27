@@ -271,6 +271,12 @@ namespace gamescope
 
         virtual void SetCursorImage( std::shared_ptr<CursorInfo> info ) = 0;
         virtual void SetRelativeMouseMode( bool bRelative ) = 0;
+        // Where the cursor should be placed when we give up a pointer lock we are
+        // holding on someone else's compositor, in gamescope output coordinates.
+        // Without it the host puts its pointer back wherever it was grabbed,
+        // which is not where our client has since decided the cursor lives.
+        // Only the nested Wayland backend can honour this; the rest ignore it.
+        virtual void SetCursorPositionHint( double flOutputX, double flOutputY ) {}
         virtual void SetVisible( bool bVisible ) = 0;
         virtual void SetTitle( std::shared_ptr<std::string> szTitle ) = 0;
         virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) = 0;
