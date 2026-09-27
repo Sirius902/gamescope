@@ -2673,7 +2673,15 @@ bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press 
 	if ( press )
 	{
 		xkb_keysym_t keysym = xkb_state_key_get_one_sym( keyboard->xkb_state, keycode );
-		wlserver.mapPressedHotkeyKeys[ { keyboard, keycode } ] = NormalizeKeysymForHotkey( keysym );
+		xkb_keysym_t uNormalized = NormalizeKeysymForHotkey( keysym );
+
+		// A keycode the keymap resolves to no sym cannot name a binding, so recording it can only
+		// ever make the pressed set differ from one. Every path that misses such a release then
+		// wedges matching for the rest of the session.
+		if ( uNormalized == XKB_KEY_NoSymbol )
+			return false;
+
+		wlserver.mapPressedHotkeyKeys[ { keyboard, keycode } ] = uNormalized;
 	}
 	else
 	{
