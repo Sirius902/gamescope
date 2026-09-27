@@ -10717,6 +10717,12 @@ steamcompmgr_main(int argc, char **argv)
 
 				const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
 
+				// Tell wlserver too, or the two halves disagree: we would refuse
+				// this app relative mouse mode here while wlserver went on
+				// withholding its absolute motion for the same constraint, and it
+				// would receive no pointer input at all.
+				wlserver_set_ignore_mouse_constraint( bExcludedAppId );
+
 				bool bRelativeMouseMode = bPointerLocked && !bSteam && !bExcludedAppId;
 
 				// Escape hatch for a client that locks the pointer while wanting a

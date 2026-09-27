@@ -143,6 +143,13 @@ struct wlserver_t {
 	bool physical_cursor_move = false;
 	pixman_region32_t confine;
 	std::atomic<struct wlr_pointer_constraint_v1 *> mouse_constraint = { nullptr };
+	// Set when the focused app is one we have decided not to act on a pointer
+	// constraint for -- the relative-mouse denylist, for apps that constrain the
+	// pointer but want absolute input anyway. Withholding absolute motion from
+	// such an app while also refusing it relative mouse mode leaves it with no
+	// pointer input at all, so both halves have to agree, and this is what they
+	// agree on. Written by steamcompmgr, read by wlserver.
+	std::atomic<bool> ignore_mouse_constraint = { false };
 
 	void SetMouseConstraint( struct wlr_pointer_constraint_v1 *pConstraint )
 	{
@@ -269,6 +276,10 @@ void wlserver_set_keyboard_layout( const char *pszLayout );
 void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x = 0, int y = 0 );
 void wlserver_clear_dropdowns();
 void wlserver_notify_dropdown( struct wlr_surface *wlrsurface, int nX, int nY );
+// Whether to act on the focused surface's pointer constraint at all. Safe to
+// call from any thread.
+void wlserver_set_ignore_mouse_constraint( bool bIgnore );
+
 void wlserver_mousemotion( double x, double y, uint32_t time );
 void wlserver_mousehide();
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );

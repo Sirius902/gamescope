@@ -3068,13 +3068,31 @@ static void handle_pointer_constraint(struct wl_listener *listener, void *data)
 		wlserver_constrain_cursor(pConstraint);
 }
 
+void wlserver_set_ignore_mouse_constraint( bool bIgnore )
+{
+	wlserver.ignore_mouse_constraint.store( bIgnore, std::memory_order_relaxed );
+}
+
+// Whether a pointer lock is in force for the purpose of withholding absolute
+// motion from the client. A lock we have deliberately declined to act on is
+// not: swallowing an app's absolute motion while steamcompmgr separately
+// refuses it relative mouse mode leaves it with no pointer input whatsoever,
+// which is the opposite of what the denylist is for.
+static bool wlserver_pointer_lock_in_force( struct wlr_pointer_constraint_v1 *pConstraint )
+{
+	if ( !pConstraint || pConstraint->type != WLR_POINTER_CONSTRAINT_V1_LOCKED )
+		return false;
+
+	return !wlserver.ignore_mouse_constraint.load( std::memory_order_relaxed );
+}
+
 static bool wlserver_apply_constraint( double *dx, double *dy )
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 
 	if ( pConstraint )
 	{
-		if ( pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED )
+		if ( wlserver_pointer_lock_in_force( pConstraint ) )
 			return false;
 
 		// wlroots >= 0.19 leaves constraint->region empty until the first commit after a regionless confine
@@ -3161,7 +3179,7 @@ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 	// says so outright -- and the position it holds stays frozen until the lock
 	// goes away. The relative motion sent above is the whole of what it gets,
 	// which is precisely what the lock exists to deliver.
-	if ( pConstraint && pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED )
+	if ( wlserver_pointer_lock_in_force( pConstraint ) )
 	{
 		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 		return;
