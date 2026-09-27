@@ -100,7 +100,11 @@ public:
 
 	void checkSuspension();
 
-	bool IsConstrained() const { return m_bConstrained; }
+	// Whether the focused surface holds a zwp_locked_pointer_v1. This is the
+	// protocol's own answer to "does this client want the pointer captured and
+	// delivered as relative motion", which is exactly what relative mouse mode
+	// needs to know, so it is what that decision keys off.
+	bool IsPointerLocked() const { return m_bPointerLocked; }
 private:
 
 	bool getTexture();
@@ -108,7 +112,13 @@ private:
 	void updateCursorFeedback( bool bForce = false );
 
 	int m_x = 0, m_y = 0;
-	bool m_bConstrained = false;
+	bool m_bPointerLocked = false;
+	// Whether the active constraint supplied a cursor position hint. That is an
+	// optional request whose only defined purpose is saying where the cursor
+	// should be placed when the constraint ends, so it decides m_x/m_y and
+	// nothing else. It is not a usable proxy for "the pointer is constrained":
+	// a client may lock without ever sending one.
+	bool m_bHasCursorHint = false;
 	int m_hotspotX = 0, m_hotspotY = 0;
 
 	gamescope::OwningRc<CVulkanTexture> m_texture;

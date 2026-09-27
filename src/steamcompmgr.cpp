@@ -2063,16 +2063,21 @@ void MouseCursor::UpdatePosition()
 {
 	wlserver_lock();
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
+
+	m_bPointerLocked = pConstraint && pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED;
+
+	// The hint says where to put the cursor once the constraint goes away, so it
+	// is the right source for the painted position and for nothing else.
 	if ( pConstraint && pConstraint->current.cursor_hint.enabled )
 	{
-		m_bConstrained = true;
+		m_bHasCursorHint = true;
 
 		m_x = pConstraint->current.cursor_hint.x;
 		m_y = pConstraint->current.cursor_hint.y;
 	}
 	else
 	{
-		m_bConstrained = false;
+		m_bHasCursorHint = false;
 
 		m_x = wlserver.mouse_surface_cursorx;
 		m_y = wlserver.mouse_surface_cursory;
@@ -9542,6 +9547,11 @@ RelativeMouseFilterDefaults(),
 	s_uRelativeMouseFilteredAppids = std::move( uFilterAppids );
 }, true);
 
+// Relative mouse mode follows the client's pointer lock. Set this to also
+// require an empty cursor image, which is what it used to require unconditionally.
+gamescope::ConVar<bool> cv_mouse_relative_requires_hidden_cursor( "mouse_relative_requires_hidden_cursor", false,
+	"Should relative mouse mode additionally require the app to have hidden its cursor?" );
+
 void LaunchNestedChildren( char **ppPrimaryChildArgv )
 {
 	// We could just run this inside the child process,
@@ -10685,11 +10695,21 @@ steamcompmgr_main(int argc, char **argv)
 
 			if ( pPaintFocus->GetNestedHints() && !g_bForceRelativeMouse )
 			{
-				const bool bImageEmpty =
-					( pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty() ) &&
-					( !window_is_steam( pPaintFocus->inputFocusWindow ) );
+				// A locked pointer is the client stating outright that it wants
+				// the pointer captured and delivered as relative motion. That is
+				// the whole question being asked here, so ask it directly.
+				//
+				// This used to also require the cursor image to be empty, as a
+				// proxy for "this is a mouse-look game". It is a bad proxy and an
+				// unstable one: MouseCursor::setDirty() clears m_imageEmpty on
+				// every XFixesCursorNotify, before anything has looked at the new
+				// image, so any client that redraws its cursor drags mouse-look in
+				// and out of relative mode with it.
+				const bool bPointerLocked = pPaintFocus->cursor && pPaintFocus->cursor->IsPointerLocked();
 
-				const bool bHasPointerConstraint = pPaintFocus->cursor && pPaintFocus->cursor->IsConstrained();
+				// Steam never locks the pointer, and capturing it would be a
+				// regression with no upside, so keep it out regardless.
+				const bool bSteam = window_is_steam( pPaintFocus->inputFocusWindow );
 
 				uint32_t uAppId = pPaintFocus->inputFocusWindow
 					? pPaintFocus->inputFocusWindow->appID
@@ -10697,7 +10717,13 @@ steamcompmgr_main(int argc, char **argv)
 
 				const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
 
-				const bool bRelativeMouseMode = bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
+				bool bRelativeMouseMode = bPointerLocked && !bSteam && !bExcludedAppId;
+
+				// Escape hatch for a client that locks the pointer while wanting a
+				// visible cursor, restoring the old requirement. Here so the
+				// behaviour change has a way back without a rebuild.
+				if ( cv_mouse_relative_requires_hidden_cursor )
+					bRelativeMouseMode = bRelativeMouseMode && pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty();
 
 				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
 			}
