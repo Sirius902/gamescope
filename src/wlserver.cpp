@@ -2924,6 +2924,51 @@ static void wlserver_warp_to_constraint_hint()
 	}
 }
 
+// Pixman's x2/y2 are exclusive, so the last point actually inside a box is
+// x2 - 1. wlr_region_confine() clamps to exactly that (util/region.c:192-193);
+// match it, or a confined cursor comes to rest one pixel outside its own
+// region. Written as max(min()) rather than std::clamp because a degenerate
+// box makes the bounds cross, which std::clamp leaves undefined.
+static double wlserver_clamp_to_box( double v, int32_t nLo, int32_t nHiExclusive )
+{
+	return std::max<double>( std::min<double>( v, nHiExclusive - 1 ), nLo );
+}
+
+// Pull a point onto the nearest rectangle of a region. False if the region has
+// no rectangles to pull it onto, in which case the point is left alone.
+//
+// This is a nearest-point projection, deliberately unlike the path-aware
+// sliding of wlr_region_confine() used on the relative path: an absolute warp
+// has no path from anywhere to slide along, only a destination.
+static bool wlserver_clamp_to_region( pixman_region32_t *pRegion, double *px, double *py )
+{
+	int nBoxes = 0;
+	pixman_box32_t *pBoxes = pixman_region32_rectangles( pRegion, &nBoxes );
+	if ( !nBoxes )
+		return false;
+
+	double flBestDistSqr = DBL_MAX;
+	int nBestBox = 0;
+	for ( int i = 0; i < nBoxes; i++ )
+	{
+		double cx = wlserver_clamp_to_box( *px, pBoxes[i].x1, pBoxes[i].x2 );
+		double cy = wlserver_clamp_to_box( *py, pBoxes[i].y1, pBoxes[i].y2 );
+		double dx = cx - *px;
+		double dy = cy - *py;
+		double flDistSqr = dx * dx + dy * dy;
+		if ( flDistSqr < flBestDistSqr )
+		{
+			flBestDistSqr = flDistSqr;
+			nBestBox = i;
+		}
+	}
+
+	*px = wlserver_clamp_to_box( *px, pBoxes[nBestBox].x1, pBoxes[nBestBox].x2 );
+	*py = wlserver_clamp_to_box( *py, pBoxes[nBestBox].y1, pBoxes[nBestBox].y2 );
+
+	return true;
+}
+
 static void wlserver_update_cursor_constraint()
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
@@ -2937,31 +2982,8 @@ static void wlserver_update_cursor_constraint()
 
 		if (!pixman_region32_contains_point(pRegion, floor(wlserver.mouse_surface_cursorx), floor(wlserver.mouse_surface_cursory), NULL))
 		{
-			int nboxes;
-			pixman_box32_t *boxes = pixman_region32_rectangles(pRegion, &nboxes);
-			if ( nboxes )
-			{
-				double flBestDistSqr = DBL_MAX;
-				int nBestBox = 0;
-				for ( int i = 0; i < nboxes; i++ )
-				{
-					double cx = std::clamp<double>( wlserver.mouse_surface_cursorx, boxes[i].x1, boxes[i].x2 );
-					double cy = std::clamp<double>( wlserver.mouse_surface_cursory, boxes[i].y1, boxes[i].y2 );
-					double dx = cx - wlserver.mouse_surface_cursorx;
-					double dy = cy - wlserver.mouse_surface_cursory;
-					double flDistSqr = dx * dx + dy * dy;
-					if ( flDistSqr < flBestDistSqr )
-					{
-						flBestDistSqr = flDistSqr;
-						nBestBox = i;
-					}
-				}
-
-				wlserver.mouse_surface_cursorx = std::clamp<double>( wlserver.mouse_surface_cursorx, boxes[nBestBox].x1, boxes[nBestBox].x2);
-				wlserver.mouse_surface_cursory = std::clamp<double>( wlserver.mouse_surface_cursory, boxes[nBestBox].y1, boxes[nBestBox].y2);
-
+			if ( wlserver_clamp_to_region( pRegion, &wlserver.mouse_surface_cursorx, &wlserver.mouse_surface_cursory ) )
 				wlr_seat_pointer_warp( wlserver.wlr.seat, wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
-			}
 		}
 	}
 
@@ -3112,6 +3134,44 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 {
 	assert( wlserver_is_lock_held() );
+
+	// Xwayland decides which of its two pointer devices to post on once per
+	// wl_pointer.frame, and the only thing it looks at is whether a relative
+	// motion arrived alongside the absolute one -- the values are never
+	// examined (hw/xwayland/xwayland-input.c, relative_pointer_handle_relative_motion
+	// and dispatch_absolute_motion). A motion-only frame goes to its absolute
+	// device, and the X11 master pointer then adopts that device's valuator
+	// classes wholesale, which disables relative raw input for every X11 client
+	// on that server until something else reports. For a game reading relative
+	// mouse-look that is the difference between working and spinning wildly.
+	//
+	// So pair one, and send zero. This path has absolute positions and no
+	// relative data: the only way to produce a delta here is to difference
+	// successive positions, and that cannot tell movement from a teleport. The
+	// pointer is warped out from under it constantly -- a constraint hint, a
+	// focus change, the host compositor repositioning its own pointer when we
+	// drop a lock -- and every one of those would otherwise be handed to the
+	// client as one enormous mouse-look event. Anything that genuinely has
+	// relative data reports it through wlserver_mousemotion() instead.
+	wlserver_perform_rel_pointer_motion( 0.0, 0.0 );
+
+	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
+
+	// A locked pointer may not be sent wl_pointer.motion at all -- the protocol
+	// says so outright -- and the position it holds stays frozen until the lock
+	// goes away. The relative motion sent above is the whole of what it gets,
+	// which is precisely what the lock exists to deliver.
+	if ( pConstraint && pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED )
+	{
+		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+		return;
+	}
+
+	// Confined: stay inside the region instead of escaping it. wlroots >= 0.19
+	// leaves the region empty until the first commit after a regionless confine,
+	// which confines nothing.
+	if ( pConstraint && !pixman_region32_empty( &wlserver.confine ) )
+		wlserver_clamp_to_region( &wlserver.confine, &x, &y );
 
 	wlserver.mouse_surface_cursorx = x;
 	wlserver.mouse_surface_cursory = y;
