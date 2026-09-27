@@ -2,6 +2,7 @@
 #define _GNU_SOURCE 1
 
 #include <assert.h>
+#include <cmath>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -82,6 +83,48 @@
 #include <set>
 
 static LogScope wl_log("wlserver");
+
+LogScope pointer_log("pointer");
+std::atomic<uint32_t> g_uPointerTraceBurst = { 0u };
+
+std::atomic<uint32_t> g_uPointerRelTraceBurst = { 0u };
+
+void wlserver_pointer_trace_burst( uint32_t uEvents )
+{
+	g_uPointerTraceBurst.store( uEvents, std::memory_order_relaxed );
+
+	// Relative motion is what actually drives mouse-look, and it is far denser
+	// than the absolute path, so give it its own, longer window.
+	g_uPointerRelTraceBurst.store( uEvents * 20u, std::memory_order_relaxed );
+}
+
+// Motion events are far too frequent to trace unconditionally. Only emit for a
+// large jump, or while burning down a burst armed by a relative-mode transition.
+static bool pointer_trace_motion( double dx, double dy )
+{
+	if ( !pointer_log.Enabled( LOG_DEBUG ) )
+		return false;
+
+	if ( fabs( dx ) > 50.0 || fabs( dy ) > 50.0 )
+		return true;
+
+	uint32_t uBurst = g_uPointerTraceBurst.load( std::memory_order_relaxed );
+	while ( uBurst )
+	{
+		if ( g_uPointerTraceBurst.compare_exchange_weak( uBurst, uBurst - 1, std::memory_order_relaxed ) )
+			return true;
+	}
+
+	return false;
+}
+
+static const char *pointer_constraint_type_str( struct wlr_pointer_constraint_v1 *pConstraint )
+{
+	if ( !pConstraint )
+		return "none";
+
+	return pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED ? "LOCKED" : "CONFINED";
+}
 
 using namespace std::literals;
 
@@ -337,9 +380,51 @@ static void wlserver_handle_key(struct wl_listener *listener, void *data)
 	bump_input_counter();
 }
 
+// This is the path that actually feeds mouse-look, and both input paths drive
+// it unconditionally: wlserver_mousemotion() before its constraint check, and
+// wlserver_mousewarp() for every warp. So it fires for every motion event
+// whether or not the client is told a position to go with it.
+static void wlserver_trace_rel_pointer_motion( double dx, double dy )
+{
+	if ( !pointer_log.Enabled( LOG_DEBUG ) )
+		return;
+
+	static double s_flAccumX = 0.0;
+	static double s_flAccumY = 0.0;
+	static uint32_t s_uCount = 0;
+
+	uint32_t uBurst = g_uPointerRelTraceBurst.load( std::memory_order_relaxed );
+	if ( uBurst )
+	{
+		g_uPointerRelTraceBurst.store( uBurst - 1, std::memory_order_relaxed );
+
+		s_flAccumX += dx;
+		s_flAccumY += dy;
+		s_uCount++;
+
+		pointer_log.debugf( "rel_motion #%u: d=(%.1f,%.1f) running total=(%.1f,%.1f)",
+			s_uCount, dx, dy, s_flAccumX, s_flAccumY );
+
+		if ( uBurst == 1u )
+		{
+			pointer_log.debugf( "rel_motion BURST END: %u events, total=(%.1f,%.1f) |total|=%.0f px",
+				s_uCount, s_flAccumX, s_flAccumY,
+				sqrt( s_flAccumX * s_flAccumX + s_flAccumY * s_flAccumY ) );
+			s_flAccumX = s_flAccumY = 0.0;
+			s_uCount = 0;
+		}
+		return;
+	}
+
+	if ( fabs( dx ) > 50.0 || fabs( dy ) > 50.0 )
+		pointer_log.debugf( "rel_motion: LARGE single delta=(%.1f,%.1f)", dx, dy );
+}
+
 static void wlserver_perform_rel_pointer_motion(double unaccel_dx, double unaccel_dy)
 {
 	assert( wlserver_is_lock_held() );
+
+	wlserver_trace_rel_pointer_motion( unaccel_dx, unaccel_dy );
 
 	wlr_relative_pointer_manager_v1_send_relative_motion( wlserver.relative_pointer_manager, wlserver.wlr.seat, 0, unaccel_dx, unaccel_dy, unaccel_dx, unaccel_dy );
 }
@@ -2552,6 +2637,9 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain )
 	if ( bConstrain )
 	{
 		struct wlr_pointer_constraint_v1 *constraint = wlr_pointer_constraints_v1_constraint_for_surface( wlserver.constraints, surface, wlserver.wlr.seat );
+
+		pointer_log.debugf( "keyboardfocus: surface=%p has_constraint=%d", (void *)surface, (int)!!constraint );
+
 		wlserver_constrain_cursor( constraint );
 	}
 }
@@ -2883,23 +2971,37 @@ struct GamescopePointerConstraint
 	struct wl_listener destroy{};
 };
 
-static void wlserver_warp_to_constraint_hint()
+static void wlserver_warp_to_constraint_hint( const char *pszCaller )
 {
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
-	
+
+	pointer_log.debugf( "warp_to_hint[%s]: constraint=%p type=%s hint_enabled=%d hint=(%.1f,%.1f) cursor=(%.1f,%.1f)",
+		pszCaller, (void *)pConstraint, pointer_constraint_type_str( pConstraint ),
+		pConstraint ? (int)pConstraint->current.cursor_hint.enabled : -1,
+		pConstraint ? pConstraint->current.cursor_hint.x : -1.0,
+		pConstraint ? pConstraint->current.cursor_hint.y : -1.0,
+		wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
+
 	if (pConstraint->current.cursor_hint.enabled)
 	{
 		double sx = pConstraint->current.cursor_hint.x;
 		double sy = pConstraint->current.cursor_hint.y;
 
 		if ( wlserver.mouse_surface_cursorx == sx && wlserver.mouse_surface_cursory == sy )
+		{
+			pointer_log.debugf( "warp_to_hint[%s]: no-op, cursor already at hint", pszCaller );
 			return;
+		}
+
+		const double flTeleportX = sx - wlserver.mouse_surface_cursorx;
+		const double flTeleportY = sy - wlserver.mouse_surface_cursory;
 
 		wlserver.mouse_surface_cursorx = sx;
 		wlserver.mouse_surface_cursory = sy;
 		wlr_seat_pointer_warp( wlserver.wlr.seat, sx, sy );
 
 		uint64_t ulNow = get_time_in_nanos();
+		const uint64_t ulLastMoved = wlserver.ulLastMovedCursorTime;
 		static uint32_t s_unSyntheticMoveCount = 0;
 
 		// Add a heuristic for whether the cursor is continually moving, or if
@@ -2921,6 +3023,19 @@ static void wlserver_warp_to_constraint_hint()
 
 		if ( !bSynthetic )
 			wlserver.bCursorHidden = !wlserver.bCursorHasImage;
+
+		// The seat is warped but the client is told nothing. Warping into a lock,
+		// the absolute path swallows the difference; warping back out of one, the
+		// whole of this delta still lands on the client as a single absolute
+		// motion the next time the pointer moves.
+		pointer_log.debugf( "warp_to_hint[%s]: TELEPORT delta=(%.1f,%.1f) -> (%.1f,%.1f) synthetic=%d count=%u since_last_move=%.1fms (client not notified)",
+			pszCaller, flTeleportX, flTeleportY, sx, sy,
+			(int)bSynthetic, s_unSyntheticMoveCount,
+			( ulNow - ulLastMoved ) / 1'000'000.0 );
+	}
+	else
+	{
+		pointer_log.debugf( "warp_to_hint[%s]: hint disabled, no warp", pszCaller );
 	}
 }
 
@@ -2978,7 +3093,7 @@ static void wlserver_update_cursor_constraint()
 	{
 		wlserver.mouse_constraint_requires_warp = false;
 
-		wlserver_warp_to_constraint_hint();
+		wlserver_warp_to_constraint_hint( "update_constraint" );
 
 		if (!pixman_region32_contains_point(pRegion, floor(wlserver.mouse_surface_cursorx), floor(wlserver.mouse_surface_cursory), NULL))
 		{
@@ -2997,13 +3112,22 @@ static void wlserver_constrain_cursor( struct wlr_pointer_constraint_v1 *pNewCon
 {
 	struct wlr_pointer_constraint_v1 *pOldConstraint = wlserver.GetCursorConstraint();
 
+	pointer_log.debugf( "constrain_cursor: old=%p (%s) new=%p (%s) new_hint_enabled=%d new_hint=(%.1f,%.1f) cursor=(%.1f,%.1f)%s",
+		(void *)pOldConstraint, pointer_constraint_type_str( pOldConstraint ),
+		(void *)pNewConstraint, pointer_constraint_type_str( pNewConstraint ),
+		pNewConstraint ? (int)pNewConstraint->current.cursor_hint.enabled : -1,
+		pNewConstraint ? pNewConstraint->current.cursor_hint.x : -1.0,
+		pNewConstraint ? pNewConstraint->current.cursor_hint.y : -1.0,
+		wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory,
+		pOldConstraint == pNewConstraint ? " [unchanged, early out]" : "" );
+
 	if ( pOldConstraint == pNewConstraint )
 		return;
 
 	if ( pOldConstraint )
 	{
 		if ( !pNewConstraint )
-			wlserver_warp_to_constraint_hint();
+			wlserver_warp_to_constraint_hint( "constrain_cursor_deactivate" );
 
 		wlr_pointer_constraint_v1_send_deactivated( pOldConstraint );
 	}
@@ -3028,7 +3152,12 @@ static void handle_pointer_constraint_set_region(struct wl_listener *listener, v
 	GamescopePointerConstraint *pGamescopeConstraint = wl_container_of(listener, pGamescopeConstraint, set_region);
 
 	// If the region has been updated, we might need to warp again next commit.
-	if ( pGamescopeConstraint->pConstraint == wlserver.GetCursorConstraint() )
+	const bool bIsCurrent = pGamescopeConstraint->pConstraint == wlserver.GetCursorConstraint();
+
+	pointer_log.debugf( "constraint_set_region: constraint=%p is_current=%d -> requires_warp=%d",
+		(void *)pGamescopeConstraint->pConstraint, (int)bIsCurrent, (int)bIsCurrent );
+
+	if ( bIsCurrent )
 		wlserver.mouse_constraint_requires_warp = true;
 }
 
@@ -3040,9 +3169,14 @@ void handle_constraint_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&pGamescopeConstraint->destroy.link);
 
 	struct wlr_pointer_constraint_v1 *pCurrentConstraint = wlserver.GetCursorConstraint();
+
+	pointer_log.debugf( "constraint_destroy: constraint=%p current=%p was_active=%d",
+		(void *)pGamescopeConstraint->pConstraint, (void *)pCurrentConstraint,
+		(int)( pCurrentConstraint == pGamescopeConstraint->pConstraint ) );
+
 	if ( pCurrentConstraint == pGamescopeConstraint->pConstraint )
 	{
-		wlserver_warp_to_constraint_hint();
+		wlserver_warp_to_constraint_hint( "constraint_destroy" );
 
 		wlserver.SetMouseConstraint( nullptr );
 		pixman_region32_clear( &wlserver.confine );
@@ -3064,7 +3198,18 @@ static void handle_pointer_constraint(struct wl_listener *listener, void *data)
 	pGamescopeConstraint->destroy.notify = handle_constraint_destroy;
 	wl_signal_add(&pConstraint->events.destroy, &pGamescopeConstraint->destroy);
 
-	if ( wlserver.kb_focus_surface && wlserver.kb_focus_surface == pConstraint->surface )
+	// A new constraint only takes effect if the constraining surface currently
+	// holds keyboard focus. Failing this gate is completely silent otherwise.
+	const bool bFocusGatePassed = wlserver.kb_focus_surface && wlserver.kb_focus_surface == pConstraint->surface;
+
+	pointer_log.debugf( "new_constraint: constraint=%p type=%s hint_enabled=%d hint=(%.1f,%.1f) surface=%p kb_focus=%p focus_gate=%s",
+		(void *)pConstraint, pointer_constraint_type_str( pConstraint ),
+		(int)pConstraint->current.cursor_hint.enabled,
+		pConstraint->current.cursor_hint.x, pConstraint->current.cursor_hint.y,
+		(void *)pConstraint->surface, (void *)wlserver.kb_focus_surface,
+		bFocusGatePassed ? "PASSED" : "FAILED (constraint inert)" );
+
+	if ( bFocusGatePassed )
 		wlserver_constrain_cursor(pConstraint);
 }
 
@@ -3123,10 +3268,22 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
+	const bool bTrace = pointer_trace_motion( dx, dy );
+	const double flInDx = dx;
+	const double flInDy = dy;
+	const double flOldX = wlserver.mouse_surface_cursorx;
+	const double flOldY = wlserver.mouse_surface_cursory;
+
 	wlserver_perform_rel_pointer_motion( dx, dy );
 
 	if ( !wlserver_apply_constraint( &dx, &dy ) )
 	{
+		if ( bTrace )
+		{
+			pointer_log.debugf( "mousemotion: d=(%.1f,%.1f) at (%.1f,%.1f) swallowed by constraint (%s)",
+				flInDx, flInDy, flOldX, flOldY,
+				pointer_constraint_type_str( wlserver.GetCursorConstraint() ) );
+		}
 		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 		return;
 	}
@@ -3145,6 +3302,12 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	double sy = wlserver.mouse_surface_cursory;
 	wlserver_drag_anchor_apply( sx, sy );
 
+	if ( bTrace )
+	{
+		pointer_log.debugf( "mousemotion: d=(%.1f,%.1f) constrained=(%.1f,%.1f) (%.1f,%.1f) -> notify (%.1f,%.1f)",
+			flInDx, flInDy, dx, dy, flOldX, flOldY, sx, sy );
+	}
+
 	wlr_seat_pointer_notify_motion( wlserver.wlr.seat, time, sx, sy );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 }
@@ -3152,6 +3315,10 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 {
 	assert( wlserver_is_lock_held() );
+
+	const double flOldX = wlserver.mouse_surface_cursorx;
+	const double flOldY = wlserver.mouse_surface_cursory;
+	const bool bTrace = pointer_trace_motion( x - flOldX, y - flOldY );
 
 	// Xwayland decides which of its two pointer devices to post on once per
 	// wl_pointer.frame, and the only thing it looks at is whether a relative
@@ -3181,6 +3348,12 @@ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 	// which is precisely what the lock exists to deliver.
 	if ( wlserver_pointer_lock_in_force( pConstraint ) )
 	{
+		if ( bTrace )
+		{
+			pointer_log.debugf( "mousewarp: (%.1f,%.1f) swallowed by constraint (locked), cursor holds at (%.1f,%.1f)",
+				x, y, flOldX, flOldY );
+		}
+
 		wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 		return;
 	}
@@ -3206,6 +3379,12 @@ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 	double sy = wlserver.mouse_surface_cursory;
 	wlserver_drag_anchor_apply( sx, sy );
 
+	if ( bTrace )
+	{
+		pointer_log.debugf( "mousewarp: (%.1f,%.1f) -> (%.1f,%.1f) delta=(%.1f,%.1f) synthetic=%d notify (%.1f,%.1f)",
+			flOldX, flOldY, x, y, x - flOldX, y - flOldY, (int)bSynthetic, sx, sy );
+	}
+
 	wlr_seat_pointer_notify_motion( wlserver.wlr.seat, time, sx, sy );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 }
@@ -3213,6 +3392,14 @@ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic )
 void wlserver_fake_mouse_pos( double x, double y )
 {
 	// Fake a pos for eg. hiding true cursor state from Steam.
+
+	// Zero, because this is a lie about where the pointer is and not a claim
+	// that it moved. It still has to be sent: an absolute motion with no
+	// relative motion beside it is the one thing that flips Xwayland onto its
+	// absolute pointer device, and this runs on focus changes right after the
+	// synthetic warp in steamcompmgr that already pairs its own.
+	wlserver_perform_rel_pointer_motion( 0.0, 0.0 );
+
 	wlr_seat_pointer_notify_motion( wlserver.wlr.seat, 0, x, y );
 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
 }

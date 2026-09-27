@@ -1028,6 +1028,7 @@ struct global_focus_t : public focus_t
 	unsigned int uFadeOutStartTime = 0;
 	bool bPendingFade = false;
 	GamescopeUpscaleFilter eActiveUpscaler = GamescopeUpscaleFilter::LINEAR;
+	bool bLastRelativeMouseMode = false;
 	uint64_t ulBasePlaneCommitID = 0;
 	uint32_t uBasePlaneAppID = 0;
 	bool bBasePlaneIsFifo = false;
@@ -2064,6 +2065,7 @@ void MouseCursor::UpdatePosition()
 	wlserver_lock();
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 
+	const bool bWasLocked = m_bPointerLocked;
 	m_bPointerLocked = pConstraint && pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED;
 
 	// The hint says where to put the cursor once the constraint goes away, so it
@@ -2081,6 +2083,14 @@ void MouseCursor::UpdatePosition()
 
 		m_x = wlserver.mouse_surface_cursorx;
 		m_y = wlserver.mouse_surface_cursory;
+	}
+
+	if ( bWasLocked != m_bPointerLocked )
+	{
+		pointer_log.debugf( "pointer_locked: %d -> %d (constraint=%p type=%s hint_enabled=%d) pos=(%d,%d)",
+			(int)bWasLocked, (int)m_bPointerLocked, (void *)pConstraint,
+			pConstraint ? ( pConstraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED ? "LOCKED" : "CONFINED" ) : "none",
+			(int)m_bHasCursorHint, m_x, m_y );
 	}
 	wlserver_unlock();
 }
@@ -2130,6 +2140,9 @@ void MouseCursor::checkSuspension()
 void MouseCursor::setDirty()
 {
 	// We can't prove it's empty until checking again
+	if ( m_imageEmpty )
+		pointer_log.debugf( "image_empty: true -> false (setDirty, optimistic)" );
+
 	m_imageEmpty = false;
 	m_dirty = true;
 }
@@ -2340,6 +2353,13 @@ bool MouseCursor::getTexture()
 
 	if (bNoCursor)
 		cursorBuffer.clear();
+
+	if ( m_imageEmpty != bNoCursor )
+	{
+		pointer_log.debugf( "image_empty: %s -> %s (getTexture: game %s its cursor)",
+			m_imageEmpty ? "true" : "false", bNoCursor ? "true" : "false",
+			bNoCursor ? "hid" : "showed" );
+	}
 
 	m_imageEmpty = bNoCursor;
 
@@ -10704,7 +10724,9 @@ steamcompmgr_main(int argc, char **argv)
 				// unstable one: MouseCursor::setDirty() clears m_imageEmpty on
 				// every XFixesCursorNotify, before anything has looked at the new
 				// image, so any client that redraws its cursor drags mouse-look in
-				// and out of relative mode with it.
+				// and out of relative mode with it. Measured on Dark Souls II and
+				// III, every single relative-mode flip in a session was driven by
+				// the cursor image and none by the constraint.
 				const bool bPointerLocked = pPaintFocus->cursor && pPaintFocus->cursor->IsPointerLocked();
 
 				// Steam never locks the pointer, and capturing it would be a
@@ -10728,8 +10750,24 @@ steamcompmgr_main(int argc, char **argv)
 				// Escape hatch for a client that locks the pointer while wanting a
 				// visible cursor, restoring the old requirement. Here so the
 				// behaviour change has a way back without a rebuild.
+				const bool bImageEmpty = pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty();
 				if ( cv_mouse_relative_requires_hidden_cursor )
-					bRelativeMouseMode = bRelativeMouseMode && pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty();
+					bRelativeMouseMode = bRelativeMouseMode && bImageEmpty;
+
+				// This is recomputed from scratch every iteration with no edge
+				// detection, so the flip is otherwise invisible. Trace it, and
+				// arm a motion burst so the events either side of it are logged.
+				if ( bRelativeMouseMode != pPaintFocus->bLastRelativeMouseMode )
+				{
+					pPaintFocus->bLastRelativeMouseMode = bRelativeMouseMode;
+
+					pointer_log.debugf( "relative_mode: %s -> %s (locked=%d steam=%d excluded=%d image_empty=%d appid=%u)",
+						bRelativeMouseMode ? "off" : "on",
+						bRelativeMouseMode ? "ON" : "OFF",
+						(int)bPointerLocked, (int)bSteam, (int)bExcludedAppId, (int)bImageEmpty, uAppId );
+
+					wlserver_pointer_trace_burst( 8 );
+				}
 
 				// Keep the host told where our client believes the cursor is, so
 				// that when the lock is dropped it has somewhere correct to put

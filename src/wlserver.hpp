@@ -23,6 +23,7 @@
 #include "vulkan_include.h"
 
 #include "steamcompmgr_shared.hpp"
+#include "log.hpp"
 
 #if HAVE_DRM
 #define HAVE_SESSION 1
@@ -317,6 +318,18 @@ void wlserver_x11_surface_info_finish( struct wlserver_x11_surface_info *surf );
 void wlserver_set_xwayland_server_mode( size_t idx, int w, int h, int refresh );
 
 extern std::atomic<bool> g_bPendingTouchMovement;
+
+// Tracing for the pointer path: constraints, warps, motion, relative mode.
+// Everything is logged at debug, so it is silent at the default priority and
+// can be toggled live with `gamescopectl log_pointer debug`.
+extern LogScope pointer_log;
+
+// Bumped by the relative-mouse-mode edge detector so that the next few pointer
+// motion events trace unconditionally, regardless of how small they are. Motion
+// is otherwise only traced above a magnitude threshold to keep the log legible.
+extern std::atomic<uint32_t> g_uPointerTraceBurst;
+extern std::atomic<uint32_t> g_uPointerRelTraceBurst;
+void wlserver_pointer_trace_burst( uint32_t uEvents );
 
 void wlserver_open_steam_menu( bool qam );
 

@@ -576,6 +576,10 @@ namespace gamescope
         std::atomic<std::shared_ptr<zwp_relative_pointer_v1>> m_pRelativePointer = nullptr;
         std::unordered_set<uint32_t> m_uScancodesHeld;
 
+        // Tracing only: last verdict of the absolute-motion drop gate, so the
+        // edge can be logged rather than every motion event.
+        bool m_bTraceLastAbsMotionDropped = false;
+
         void Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion );
         static const wl_registry_listener s_RegistryListener;
 
@@ -2445,7 +2449,15 @@ namespace gamescope
         if ( !m_pPointer )
             return;
 
-        if ( !!bRelative != !!m_pLockedPointer || ( pSurface != m_pLockedSurface && bRelative ) )
+        const bool bChanging = !!bRelative != !!m_pLockedPointer || ( pSurface != m_pLockedSurface && bRelative );
+
+        if ( bChanging )
+        {
+            pointer_log.debugf( "backend SetRelativeMouseMode: enter relative=%d locked_pointer=%p locked_surface=%p surface=%p pointer_locked=%d",
+                (int)bRelative, (void *)m_pLockedPointer, (void *)m_pLockedSurface, (void *)pSurface, (int)m_bPointerLocked );
+        }
+
+        if ( bChanging )
         {
             if ( m_pLockedPointer )
             {
@@ -2461,10 +2473,10 @@ namespace gamescope
                 // where the client has since put it.
                 zwp_locked_pointer_v1_destroy( m_pLockedPointer );
                 m_pLockedPointer = nullptr;
+                m_bPointerLocked = false;
                 // Not just tidiness: a later lock can land on the same address,
                 // and would then look like one we had already told.
                 m_pCursorHintSentTo = nullptr;
-                m_bPointerLocked = false;
 
                 zwp_relative_pointer_v1_destroy( m_pRelativePointer );
                 m_pRelativePointer = nullptr;
@@ -2485,6 +2497,11 @@ namespace gamescope
             m_InputThread.SetRelativePointer( bRelative );
 
             UpdateCursor();
+
+            // Nothing is warped or reset in either direction here; the input
+            // thread picks the change up asynchronously.
+            pointer_log.debugf( "backend SetRelativeMouseMode: exit relative=%d locked_pointer=%p pointer_locked=%d",
+                (int)bRelative, (void *)m_pLockedPointer, (int)m_bPointerLocked );
         }
     }
 
@@ -2538,6 +2555,10 @@ namespace gamescope
 
         const double flSurfaceX = ( m_oCursorPositionHint->first  - oState->nDestX ) * 120.0 / uScale;
         const double flSurfaceY = ( m_oCursorPositionHint->second - oState->nDestY ) * 120.0 / uScale;
+
+        pointer_log.debugf( "backend cursor hint -> host: output=(%.1f,%.1f) surface=(%.1f,%.1f) scale=%u dest=(%d,%d)",
+            m_oCursorPositionHint->first, m_oCursorPositionHint->second,
+            flSurfaceX, flSurfaceY, uScale, oState->nDestX, oState->nDestY );
 
         zwp_locked_pointer_v1_set_cursor_position_hint( m_pLockedPointer,
             wl_fixed_from_double( flSurfaceX ), wl_fixed_from_double( flSurfaceY ) );
@@ -3008,6 +3029,8 @@ namespace gamescope
     {
         if ( bRelative == !!m_pRelativePointer.load() )
             return;
+
+        pointer_log.debugf( "input thread SetRelativePointer: %d -> %d", (int)!bRelative, (int)bRelative );
         // This constructors/destructors the display's mutex, so should be safe to do across threads.
         if ( !bRelative )
         {
@@ -3196,7 +3219,20 @@ namespace gamescope
 		if ( !pPlane )
 			return;
 
-        if ( m_pRelativePointer.load() != nullptr )
+        // Absolute motion is dropped while a relative pointer exists. This atomic
+        // is flipped from the main thread, so log every change of the verdict:
+        // events that slip through during the crossover arrive as warps.
+        const bool bDropped = m_pRelativePointer.load() != nullptr;
+        if ( bDropped != m_bTraceLastAbsMotionDropped )
+        {
+            m_bTraceLastAbsMotionDropped = bDropped;
+            pointer_log.debugf( "input thread abs motion: now %s at (%.1f,%.1f) (relative_pointer=%d kb_entered=%d)",
+                bDropped ? "DROPPED" : "PASSED THROUGH",
+                wl_fixed_to_double( fSurfaceX ), wl_fixed_to_double( fSurfaceY ),
+                (int)bDropped, (int)m_bKeyboardEntered );
+        }
+
+        if ( bDropped )
             return;
 
         if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
